@@ -175,6 +175,7 @@ architecture arch of gpu is
    -- PPU modules
    signal depth2              : std_logic;
    signal isGray              : std_logic;
+   signal isPacked            : std_logic;
    
    signal RAM_Address_BG0     : std_logic_vector(15 downto 0);
    signal RAM_Address_BG1     : std_logic_vector(15 downto 0);
@@ -327,20 +328,18 @@ begin
             
          elsif (ce = '1') then
          
+            -- TMR_CTRL only touches enable/repeat; frequency writes reload the counter but
+            -- leave enable/repeat alone - see PPU::writeIO 0xa2/0xa4/0xa6 in ares (ppu/io.cpp)
             if (TMR_CTRL_written = '1') then
                TMR_CTRL <= RegBus_Din(3 downto 0);
-               if (RegBus_Din(0) = '1') then HTMR_CTR <= HTMR_FREQ; end if;
-               if (RegBus_Din(2) = '1') then VTMR_CTR <= VTMR_FREQ; end if;
             end if;
-            
+
             if (HTMR_FREQ_H_written = '1' or HTMR_FREQ_L_written = '1') then
-               TMR_CTRL(1 downto 0) <= "11";
                if (HTMR_FREQ_L_written = '1') then HTMR_CTR <= HTMR_FREQ(15 downto 8) & RegBus_Din; end if;
                if (HTMR_FREQ_H_written = '1') then HTMR_CTR <= RegBus_Din & HTMR_FREQ( 7 downto 0); end if;
             end if;
-            
+
             if (VTMR_FREQ_H_written = '1' or VTMR_FREQ_L_written = '1') then
-               TMR_CTRL(3 downto 2) <= "11";
                if (VTMR_FREQ_L_written = '1') then VTMR_CTR <= VTMR_FREQ(15 downto 8) & RegBus_Din; end if;
                if (VTMR_FREQ_H_written = '1') then VTMR_CTR <= RegBus_Din & VTMR_FREQ( 7 downto 0); end if;
             end if;
@@ -430,7 +429,8 @@ begin
    newLine     <= '1' when (xCount = 0) else '0';
    
    depth2      <= '1' when DISP_MODE(7 downto 6) /= "11" else '0';
-   isGray      <= '1' when DISP_MODE(7 downto 6) = "00" else '0';
+   isGray      <= not DISP_MODE(7);
+   isPacked    <= '1' when DISP_MODE(7 downto 5) = "111" else '0';
    
    -- orientation
    process (clk)
@@ -618,8 +618,8 @@ begin
       lineY          => lineY,     
                         
       enable         => displayControl(0),
-      depth2         => depth2,        
-      packed         => DISP_MODE(5),        
+      depth2         => depth2,
+      packed         => isPacked,
       tilemapSize    => DISP_MODE(7),            
       screenbase     => screenMapBase(3 downto 0),    
       scrollX        => scrollX1,       
@@ -645,8 +645,8 @@ begin
       lineY          => lineY,
                         
       enable         => displayControl(1),
-      depth2         => depth2,   
-      packed         => DISP_MODE(5),       
+      depth2         => depth2,
+      packed         => isPacked,
       tilemapSize    => DISP_MODE(7),            
       screenbase     => screenMapBase(7 downto 4),    
       scrollX        => scrollX2,       
@@ -678,8 +678,8 @@ begin
       lineY          => lineY,
                 
       enable         => displayControl(2),
-      depth2         => depth2, 
-      packed         => DISP_MODE(5), 
+      depth2         => depth2,
+      packed         => isPacked,
 
       useWindow      => displayControl(3),
       WinX0          => spr2WinX0,
