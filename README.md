@@ -1,5 +1,8 @@
 # [WonderSwan](https://en.wikipedia.org/wiki/WonderSwan) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
 
+This fork from [MiSTfits](https://github.com/MiSTfits-devel/) ports accuracy fixes from the
+[ares](https://github.com/ares-emulator/ares) emulator's WonderSwan core.
+
 
 # HW Requirements
 SDRam module of any size is required

@@ -1,5 +1,5 @@
 //============================================================================
-//  WonderSwan
+//  WonderSwan (MiSTfits fork)
 //  Copyright (c) 2021 Robert Peip
 //
 //  MiSTer Framework
