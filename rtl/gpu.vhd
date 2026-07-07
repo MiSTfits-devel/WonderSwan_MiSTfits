@@ -148,8 +148,12 @@ architecture arch of gpu is
    signal spriteDMAWait       : integer range 0 to 2;
    
    signal spriteCount         : integer range 0 to 128;
-   type tspriteRAM is array(0 to 127) of std_logic_vector(31 downto 0);
-   signal spriteRAM : tspriteRAM;
+   -- flat 2x128-entry double buffer: bit 7 of the address picks the buffer (spriteField),
+   -- kept as one array + arithmetic offset rather than array-of-array so Quartus infers a
+   -- single 256-word altsyncram instead of collapsing the field-selected dimension away
+   type tspriteRAM is array(0 to 255) of std_logic_vector(31 downto 0);
+   signal spriteRAM   : tspriteRAM;
+   signal spriteField : integer range 0 to 1 := 0;
    
    -- sprite line fetching
    type tSpriteLineState is
@@ -366,7 +370,10 @@ begin
                spr2WinY1      <= SPR_WIN_Y1;
             
                if (unsigned(LINE_CUR) = 157) then
-                  lineYNext <= (others => '0');
+                  lineYNext   <= (others => '0');
+                  -- swap one line early: the LINE_CUR=158 sprite prefetch below already targets
+                  -- next frame's line 0, so it must see the buffer this frame's DMA just filled
+                  spriteField <= 1 - spriteField;
                elsif (lineYNext = LCD_VTOTAL) then
                   lineYNext <= (others => '0');
                else
@@ -495,7 +502,10 @@ begin
       if rising_edge(clk) then
       
          -- DMA
-         if (newLine = '1' and unsigned(LINE_CUR) = 142) then
+         -- triggers at the first vblank line, matching ares' oamSyncScanline() call at vcounter==144
+         -- (ws/ppu/ppu.cpp); writes target spriteField, the buffer the fetch side below is NOT
+         -- currently reading, so a game rewriting OAM every frame never tears its own read
+         if (newLine = '1' and unsigned(LINE_CUR) = 144) then
             spriteDMAon   <= '1';
             spriteDMAWait <= 2;
             spriteDMACnt  <= 0;
@@ -518,7 +528,7 @@ begin
          elsif (spriteDMAon = '1' and (to_integer(memoryArbiter) = 3 or to_integer(memoryArbiter) = 7)) then
             spriteDMAAddr <= std_logic_vector(unsigned(spriteDMAAddr) + 2);
             if (spriteDMAAddr(1) = '1') then
-               spriteRAM(spriteDMACnt) <= RAM_dataread & spriteDMAData;
+               spriteRAM(spriteField * 128 + spriteDMACnt) <= RAM_dataread & spriteDMAData;
                if (spriteDMACnt + 1 < spriteCount) then
                   spriteDMACnt <= spriteDMACnt + 1;
                else
@@ -547,7 +557,8 @@ begin
                
             when FETCHSPRITE =>
                spriteLineState <= CHECKACTIVE;
-               spriteLineData  <= spriteRAM(spriteLineCounter);
+               -- read the buffer opposite spriteField (ares: oam[!self.field()] in sprite.cpp)
+               spriteLineData  <= spriteRAM((1 - spriteField) * 128 + spriteLineCounter);
                
             when CHECKACTIVE =>
                if ((unsigned(lineYNext) - unsigned(spriteLineData(23 downto 16))) < 8) then
