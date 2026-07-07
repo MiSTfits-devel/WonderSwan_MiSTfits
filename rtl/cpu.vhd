@@ -16,7 +16,13 @@ entity cpu is
       reset             : in  std_logic;
       turbo             : in  std_logic;
       SLOWTIMING        : in  std_logic; -- only used in simulation to sync up with prefetching
-            
+
+      isColor           : in  std_logic; -- '0' = ASWAN (mono WonderSwan) SoC
+      cartRomWidth      : in  std_logic; -- HW_FLAGS(2): 0 = 8-bit cart ROM bus, 1 = 16-bit
+      cartRomWait       : in  std_logic; -- HW_FLAGS(3): 0 = +0 cycles, 1 = +1 cycle
+      cartSramWait      : in  std_logic; -- DISP_MODE(1): 0 = +0 cycles, 1 = +1 cycle
+      cartIoWait        : in  std_logic; -- DISP_MODE(3): 0 = +0 cycles, 1 = +1 cycle
+
       cpu_idle          : out std_logic;
       cpu_halt          : out std_logic;
       cpu_irqrequest    : out std_logic;
@@ -386,8 +392,45 @@ architecture arch of cpu is
    signal testcmd          : unsigned(31 downto 0);
    signal testpcsum        : unsigned(63 downto 0);
 
+   -- cartridge bus width / wait states
+   signal isASWAN           : std_logic;
+   signal prefetchExtraWait : std_logic;
+   signal writeWaitCarry    : integer range 0 to 1; -- OP_MOVMEM/OP_STRINGSTORE: wait-state charge from a non-finishing first pass, folded in when the write finishes
+
+   -- address-space classification, mirrors ares CPU::width()/speed()/ioSpeed() (ares/ws/cpu/cpu.cpp)
+   function busIsByteWidth(addr : unsigned(19 downto 0); romWidth : std_logic) return std_logic is
+      variable region : integer range 0 to 15;
+   begin
+      region := to_integer(addr(19 downto 16));
+      if    (region = 0) then return '0';          -- internal RAM: always word-wide
+      elsif (region = 1) then return '1';          -- cart SRAM: always byte-wide
+      elsif (romWidth = '1') then return '0';      -- cart ROM: per HW_FLAGS(2)
+      else return '1';
+      end if;
+   end function;
+
+   function busExtraWait(addr : unsigned(19 downto 0); romWait : std_logic; sramWait : std_logic; isASWAN : std_logic) return std_logic is
+      variable region : integer range 0 to 15;
+   begin
+      region := to_integer(addr(19 downto 16));
+      if    (region = 0) then return '0';                                    -- internal RAM: never
+      elsif (region = 1) then
+         if (sramWait = '1' or isASWAN = '1') then return '1'; else return '0'; end if;
+      else return romWait;                                                    -- cart ROM: HW bit only, no ASWAN override
+      end if;
+   end function;
+
+   function ioExtraWait(ioport : unsigned(7 downto 0); ioWait : std_logic; isASWAN : std_logic) return std_logic is
+   begin
+      if (ioport >= 192) then                                                 -- ports 0xC0-0xFF are cartridge-side registers
+         if (ioWait = '1' or isASWAN = '1') then return '1'; else return '0'; end if;
+      else return '0';
+      end if;
+   end function;
 
 begin
+
+   isASWAN        <= not isColor;
 
    cpu_idle       <= '1' when cpustage = CPUSTAGE_IDLE else '0';
    cpu_halt       <= halt;
@@ -492,6 +535,9 @@ begin
       variable newRepeat         : std_logic;
       variable jumpNow           : std_logic;
       variable jumpAddr          : unsigned(15 downto 0);
+      variable varBusLinAddr     : unsigned(19 downto 0);
+      variable varWordBusAligned : std_logic;
+      variable varThisWaitAdd    : integer range 0 to 1;
    begin
       if rising_edge(clk) then
          
@@ -559,9 +605,13 @@ begin
             repeat     <= '0';        
             repeatNext <= '0'; 
             
-            irqrequest <= '0'; 
-            irqBlocked <= '0'; 
-            
+            irqrequest <= '0';
+            irqBlocked <= '0';
+
+            writeWaitCarry    <= 0;
+            prefetchExtraWait <= '0';
+
+
             prefixSegmentES <= '0';  
             prefixSegmentCS <= '0';  
             prefixSegmentSS <= '0';  
@@ -1516,30 +1566,39 @@ begin
                      cpustage      <= CPUSTAGE_FETCHMEM_REC;   
                   
                   when CPUSTAGE_FETCHMEM_REC =>
+                     varmemSegment := memSegment;
+                     if (prefixSegmentES = '1') then varmemSegment := regs.reg_es; end if;
+                     if (prefixSegmentCS = '1') then varmemSegment := regs.reg_cs; end if;
+                     if (prefixSegmentSS = '1') then varmemSegment := regs.reg_ss; end if;
+                     if (prefixSegmentDS = '1') then varmemSegment := regs.reg_ds; end if;
+                     varBusLinAddr := resize(varmemSegment * 16 + memAddr, 20);
+
                      if (source1 = OPSOURCE_MEM and fetchedSource1 = '0') then
                         if (opsize = 1) then
                            memFetchValue1 <= x"00" & unsigned(bus_dataread(7 downto 0));
                            if (source2 = OPSOURCE_MEM) then memAddr <= memAddr + 1; end if;
                            fetchedSource1 <= '1';
-                           cpustage       <= CPUSTAGE_CHECKDATAREADY;
+                           if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
                            if (pushlist /= x"0000" or (fetchedSource2 = '0' and (source2 <= OPSOURCE_FETCHVALUE8 or source2 <= OPSOURCE_FETCHVALUE16 or source2 <= OPSOURCE_MEM))) then
                               cpustage <= CPUSTAGE_CHECKDATAREADY;
                            else
                               cpustage <= CPUSTAGE_EXECUTE;
-                           end if;  
+                           end if;
                         else
                            if (unaligned1 = '1') then
                               if (source2 = OPSOURCE_MEM) then memAddr <= memAddr + 2; end if;
                               fetchedSource1              <= '1';
                               memFetchValue1(15 downto 8) <= unsigned(bus_dataread(7 downto 0));
+                              if (busExtraWait(varBusLinAddr + 1, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
                               if (pushlist /= x"0000" or (fetchedSource2 = '0' and (source2 <= OPSOURCE_FETCHVALUE8 or source2 <= OPSOURCE_FETCHVALUE16 or source2 <= OPSOURCE_MEM))) then
                                  cpustage <= CPUSTAGE_CHECKDATAREADY;
                               else
                                  cpustage <= CPUSTAGE_EXECUTE;
-                              end if;  
+                              end if;
                            else
                               memFetchValue1 <= unsigned(bus_dataread);
-                              if (memAddr(0) = '1') then
+                              if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
+                              if (memAddr(0) = '1' or busIsByteWidth(varBusLinAddr, cartRomWidth) = '1') then
                                  unaligned1   <= '1';
                                  cpustage     <= CPUSTAGE_FETCHMEM_REQ;
                               else
@@ -1550,14 +1609,15 @@ begin
                                     cpustage <= CPUSTAGE_CHECKDATAREADY;
                                  else
                                     cpustage <= CPUSTAGE_EXECUTE;
-                                 end if;  
+                                 end if;
                               end if;
                            end if;
-                        end if;            
+                        end if;
                      elsif (source2 = OPSOURCE_MEM and fetchedSource2 = '0') then
                         if (opsize = 1) then
                            memFetchValue2 <= x"00" & unsigned(bus_dataread(7 downto 0));
                            fetchedSource2 <= '1';
+                           if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
                            if (pushlist /= x"0000") then
                               cpustage <= CPUSTAGE_CHECKDATAREADY;
                            else
@@ -1567,6 +1627,7 @@ begin
                            if (unaligned2 = '1') then
                               fetchedSource2              <= '1';
                               memFetchValue2(15 downto 8) <= unsigned(bus_dataread(7 downto 0));
+                              if (busExtraWait(varBusLinAddr + 1, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
                               if (pushlist /= x"0000") then
                                  cpustage <= CPUSTAGE_CHECKDATAREADY;
                               else
@@ -1574,7 +1635,8 @@ begin
                               end if;
                            else
                               memFetchValue2 <= unsigned(bus_dataread);
-                              if (memAddr(0) = '1') then
+                              if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
+                              if (memAddr(0) = '1' or busIsByteWidth(varBusLinAddr, cartRomWidth) = '1') then
                                  unaligned2   <= '1';
                                  cpustage     <= CPUSTAGE_FETCHMEM_REQ;
                               else
@@ -1587,7 +1649,7 @@ begin
                                  end if;
                               end if;
                            end if;
-                        end if;  
+                        end if;
                      end if;
                      
 -- ####################################################################################
@@ -1657,12 +1719,14 @@ begin
                         end case;
                         
                         if (pushFirst = '1') then
+                           varBusLinAddr := resize(regs.reg_ss * 16 + regs.reg_sp - 2, 20);
+                           if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
                            if (regs.reg_sp(0) = '0') then -- aligned
                               regs.reg_sp      <= regs.reg_sp - 2;
                               bus_read         <= '0';
                               bus_write        <= '1';
                               bus_be           <= "11";
-                              bus_addr         <= resize(regs.reg_ss * 16 + regs.reg_sp - 2, 20);
+                              bus_addr         <= varBusLinAddr;
                               bus_datawrite    <= pushValue;
                               prefetchAllow    <= '0';
                               cpustage         <= CPUSTAGE_CHECKDATAREADY;
@@ -1671,17 +1735,19 @@ begin
                               bus_read         <= '0';
                               bus_write        <= '1';
                               bus_be           <= "01";
-                              bus_addr         <= resize(regs.reg_ss * 16 + regs.reg_sp - 2, 20);
+                              bus_addr         <= varBusLinAddr;
                               bus_datawrite    <= pushValue;
                               prefetchAllow    <= '0';
                               pushFirst        <= '0';
                            end if;
                         else
+                           varBusLinAddr := resize(regs.reg_ss * 16 + regs.reg_sp - 1, 20);
+                           if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
                            regs.reg_sp      <= regs.reg_sp - 2;
                            bus_read         <= '0';
                            bus_write        <= '1';
                            bus_be           <= "01";
-                           bus_addr         <= resize(regs.reg_ss * 16 + regs.reg_sp - 1, 20);
+                           bus_addr         <= varBusLinAddr;
                            bus_datawrite    <= x"00" & pushValue(15 downto 8);
                            prefetchAllow    <= '0';
                            cpustage         <= CPUSTAGE_CHECKDATAREADY;
@@ -1724,9 +1790,16 @@ begin
                         poplist(poptarget) <= '0';    
                      end if;
                   
-                  when CPUSTAGE_POP_REC =>  
+                  when CPUSTAGE_POP_REC =>
                      cpustage <= CPUSTAGE_POP_REQ;
-                  
+
+                     if (popFirst = '1') then
+                        varBusLinAddr := resize(regs.reg_ss * 16 + regs.reg_sp, 20);
+                     else
+                        varBusLinAddr := resize(regs.reg_ss * 16 + regs.reg_sp + 1, 20);
+                     end if;
+                     if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
+
                      popValue := bus_dataread;
                      popDone := '0';
                      if (popFirst = '1') then
@@ -2181,33 +2254,45 @@ begin
                               if (bus_read = '0' and bus_write = '0' and (waitexe = '0' or ce = '1')) then
                                  memFirst  <= '0';
                                  waitexe   <= '1';
-                                 
+
                                  varmemSegment := memSegment;
                                  if (prefixSegmentES = '1') then varmemSegment := regs.reg_es; end if;
                                  if (prefixSegmentCS = '1') then varmemSegment := regs.reg_cs; end if;
                                  if (prefixSegmentSS = '1') then varmemSegment := regs.reg_ss; end if;
                                  if (prefixSegmentDS = '1') then varmemSegment := regs.reg_ds; end if;
+                                 varBusLinAddr := resize(varmemSegment * 16 + memAddr, 20);
+
+                                 varWordBusAligned := '0';
+                                 if (opsize = 2 and memAddr(0) = '0' and busIsByteWidth(varBusLinAddr, cartRomWidth) = '0') then
+                                    varWordBusAligned := '1';
+                                 end if;
+
                                  bus_read          <= '0';
                                  bus_write         <= '1';
-                        
+
                                  if (memFirst = '0') then
-                                    bus_addr         <= resize(varmemSegment * 16 + memAddr + 1, 20);
+                                    bus_addr         <= varBusLinAddr + 1;
                                     bus_datawrite    <= x"00" & std_logic_vector(resultval(15 downto 8));
                                     bus_be           <= "01";
-                                 elsif (opsize = 2 and memAddr(0) = '0') then
-                                    bus_addr         <= resize(varmemSegment * 16 + memAddr, 20);
+                                    if (busExtraWait(varBusLinAddr + 1, cartRomWait, cartSramWait, isASWAN) = '1') then varThisWaitAdd := 1; else varThisWaitAdd := 0; end if;
+                                 elsif (varWordBusAligned = '1') then
+                                    bus_addr         <= varBusLinAddr;
                                     bus_datawrite    <= std_logic_vector(resultval);
                                     bus_be           <= "11";
+                                    if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then varThisWaitAdd := 1; else varThisWaitAdd := 0; end if;
                                  else
-                                    bus_addr         <= resize(varmemSegment * 16 + memAddr, 20);
+                                    bus_addr         <= varBusLinAddr;
                                     bus_datawrite    <= std_logic_vector(resultval);
                                     bus_be           <= "01";
+                                    if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then varThisWaitAdd := 1; else varThisWaitAdd := 0; end if;
                                  end if;
-                                 
-                                 if (opsize = 1 or memFirst = '0' or memAddr(0) = '0') then
+
+                                 if (opsize = 1 or memFirst = '0' or varWordBusAligned = '1') then
                                     if (SLOWTIMING = '1') then newExeDelay := newExeDelay + 1; end if;
+                                    newExeDelay    := newExeDelay + writeWaitCarry + varThisWaitAdd;
+                                    writeWaitCarry <= 0;
                                     if (opcodeNext /= OP_INVALID) then
-                                       if (target_reg2 /= CPU_REG_NONE) then 
+                                       if (target_reg2 /= CPU_REG_NONE) then
                                           target_reg <= target_reg2;
                                        end if;
                                        optarget       <= optarget2;
@@ -2218,9 +2303,11 @@ begin
                                     else
                                        exeDone      := '1';
                                     end if;
+                                 else
+                                    writeWaitCarry <= varThisWaitAdd;
                                  end if;
                               elsif (waitexe = '1' and ce = '1') then
-                                 waitexe <= '0'; 
+                                 waitexe <= '0';
                               end if;
                            else
                               exeDone   := '1';
@@ -2299,6 +2386,7 @@ begin
                               when 1 =>
                                  opstep <= 2;
                                  memFetchValue1(7 downto 0) <= unsigned(RegBus_Dout);
+                                 if (ioExtraWait(source1Val(7 downto 0), cartIoWait, isASWAN) = '1') then delay <= 1; end if;
                                  if (opcodeNext = OP_INVALID) then
                                     regs.reg_ax(7 downto 0) <= unsigned(RegBus_Dout);
                                  end if;
@@ -2318,8 +2406,9 @@ begin
                                     RegBus_rden  <= '1';
                                  end if;
 
-                              when 2 => 
+                              when 2 =>
                                  memFetchValue1(15 downto 8)  <= unsigned(RegBus_Dout);
+                                 if (ioExtraWait(source1Val(7 downto 0) + 1, cartIoWait, isASWAN) = '1') then delay <= 1; end if;
                                  if (opcodeNext = OP_INVALID) then
                                     regs.reg_ax(15 downto 8)  <= unsigned(RegBus_Dout);
                                  end if;
@@ -2343,16 +2432,23 @@ begin
                               RegBus_Din   <= std_logic_vector(source2Val(7 downto 0));
                               RegBus_Adr   <= std_logic_vector(source1Val(7 downto 0));
                               RegBus_wren  <= '1';
+                              if (ioExtraWait(source1Val(7 downto 0), cartIoWait, isASWAN) = '1') then varThisWaitAdd := 1; else varThisWaitAdd := 0; end if;
                            elsif (ce = '1') then
                               RegBus_Din   <= std_logic_vector(source2Val(15 downto 8));
                               RegBus_Adr   <= std_logic_vector(source1Val(7 downto 0) + 1);
                               RegBus_wren  <= '1';
+                              if (ioExtraWait(source1Val(7 downto 0) + 1, cartIoWait, isASWAN) = '1') then varThisWaitAdd := 1; else varThisWaitAdd := 0; end if;
+                           else
+                              varThisWaitAdd := 0;
                            end if;
                            if (opsize = 1 or (memFirst = '0' and ce = '1')) then
                               exeDone      := '1';
-                              newExeDelay  := newExeDelay + 1;
+                              newExeDelay  := newExeDelay + 1 + writeWaitCarry + varThisWaitAdd;
+                              writeWaitCarry <= 0;
+                           elsif (opsize = 2 and memFirst = '1') then
+                              writeWaitCarry <= varThisWaitAdd;
                            end if;
-                           
+
                         when OP_STRINGLOAD =>
                            if (repeat = '1' and regs.reg_cx = 0) then
                               repeat          <= '0';
@@ -2386,10 +2482,21 @@ begin
                                  
                                  when 1 => opstep <= 2;
                                  
-                                 when 2 => 
+                                 when 2 =>
                                     opstep <= 0;
                                     memFirst <= '0';
-                                    if (opsize = 1 or memFirst = '1') then 
+                                    varmemSegment := regs.reg_ds;
+                                    if (prefixSegmentES = '1') then varmemSegment := regs.reg_es; end if;
+                                    if (prefixSegmentCS = '1') then varmemSegment := regs.reg_cs; end if;
+                                    if (prefixSegmentSS = '1') then varmemSegment := regs.reg_ss; end if;
+                                    if (prefixSegmentDS = '1') then varmemSegment := regs.reg_ds; end if;
+                                    if (memFirst = '0') then
+                                       varBusLinAddr := resize(varmemSegment * 16 + regs.reg_si + 1, 20);
+                                    else
+                                       varBusLinAddr := resize(varmemSegment * 16 + regs.reg_si, 20);
+                                    end if;
+                                    if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
+                                    if (opsize = 1 or memFirst = '1') then
                                        stringLoad(7 downto 0) <= unsigned(bus_dataread(7 downto 0));
                                        if (opsize = 1) then stringLoad(15 downto 8) <= x"00"; end if;
                                     else
@@ -2452,9 +2559,15 @@ begin
                                  
                                  when 1 => opstep <= 2;
                                  
-                                 when 2 => 
+                                 when 2 =>
                                     memFirst <= '0';
-                                    if (opsize = 1 or memFirst = '1') then 
+                                    if (memFirst = '0') then
+                                       varBusLinAddr := resize(regs.reg_es * 16 + regs.reg_di + 1, 20);
+                                    else
+                                       varBusLinAddr := resize(regs.reg_es * 16 + regs.reg_di, 20);
+                                    end if;
+                                    if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
+                                    if (opsize = 1 or memFirst = '1') then
                                        stringLoad2(7 downto 0) <= unsigned(bus_dataread(7 downto 0));
                                        if (opsize = 1) then stringLoad2(15 downto 8) <= x"00"; end if;
                                     else
@@ -2507,23 +2620,27 @@ begin
                               if (bus_read = '0' and bus_write = '0' and (waitexe = '0' or ce = '1')) then
                                  memFirst  <= '0';
                                  waitexe   <= '1';
-                                 
+
                                  bus_read          <= '0';
                                  bus_write         <= '1';
                                  bus_be            <= "01";
                                  if (memFirst = '0') then
                                     bus_datawrite    <= x"00" & std_logic_vector(resultval(15 downto 8));
-                                    bus_addr         <= resize(regs.reg_es * 16 + regs.reg_di + 1, 20);
+                                    varBusLinAddr    := resize(regs.reg_es * 16 + regs.reg_di + 1, 20);
                                  else
                                     bus_datawrite    <= x"00" & std_logic_vector(resultval(7 downto 0));
-                                    bus_addr         <= resize(regs.reg_es * 16 + regs.reg_di, 20);
+                                    varBusLinAddr    := resize(regs.reg_es * 16 + regs.reg_di, 20);
                                  end if;
-                                 
-                                 if (opsize = 1 or memFirst = '0') then 
+                                 bus_addr <= varBusLinAddr;
+                                 if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then varThisWaitAdd := 1; else varThisWaitAdd := 0; end if;
+
+                                 if (opsize = 1 or memFirst = '0') then
+                                    newExeDelay    := newExeDelay + writeWaitCarry + varThisWaitAdd;
+                                    writeWaitCarry <= 0;
                                     exeDone   := '1';
-                                    if (regs.FlagDir) then 
+                                    if (regs.FlagDir) then
                                        regs.reg_di <= regs.reg_di - opsize;
-                                    else                                 
+                                    else
                                        regs.reg_di <= regs.reg_di + opsize;
                                     end if;
                                     if (repeat = '1') then
@@ -2536,12 +2653,14 @@ begin
                                           consumePrefetch <= 1;
                                        end if;
                                     end if;
+                                 else
+                                    writeWaitCarry <= varThisWaitAdd;
                                  end if;
                               elsif (waitexe = '1' and ce = '1') then
-                                 waitexe <= '0'; 
+                                 waitexe <= '0';
                               end if;
                            end if;
-                           
+
                         when OP_ENTER =>
                            case (opstep) is
                               when 0 =>
@@ -2574,7 +2693,18 @@ begin
                               
                               when 3 =>
                                  memFirst <= '0';
-                                 if (memFirst = '1') then 
+                                 varmemSegment := regs.reg_ds;
+                                 if (prefixSegmentES = '1') then varmemSegment := regs.reg_es; end if;
+                                 if (prefixSegmentCS = '1') then varmemSegment := regs.reg_cs; end if;
+                                 if (prefixSegmentSS = '1') then varmemSegment := regs.reg_ss; end if;
+                                 if (prefixSegmentDS = '1') then varmemSegment := regs.reg_ds; end if;
+                                 if (memFirst = '1') then
+                                    varBusLinAddr := resize(varmemSegment * 16 + regs.reg_bp - (enterCnt * 2), 20);
+                                 else
+                                    varBusLinAddr := resize(varmemSegment * 16 + regs.reg_bp - (enterCnt * 2) + 1, 20);
+                                 end if;
+                                 if (busExtraWait(varBusLinAddr, cartRomWait, cartSramWait, isASWAN) = '1') then delay <= 1; end if;
+                                 if (memFirst = '1') then
                                     memFetchValue1(7 downto 0)  <= unsigned(bus_dataread(7 downto 0));
                                  else
                                     memFetchValue1(15 downto 8) <= unsigned(bus_dataread(7 downto 0));
@@ -2837,18 +2967,27 @@ begin
                      prefetchState <= PREFETCH_WAIT;
                      bus_addr <= prefetchAddr;
                      bus_read <= '1';
-                     if (prefetchAddr(0) = '1') then
+                     if (prefetchAddr(0) = '1' or busIsByteWidth(prefetchAddr, cartRomWidth) = '1') then
                         prefetchAddr  <= PrefetchAddr + 1;
                         prefetch1byte <= '1';
                      else
                         prefetchAddr  <= PrefetchAddr + 2;
                         prefetch1byte <= '0';
                      end if;
+                     prefetchExtraWait <= busExtraWait(prefetchAddr, cartRomWait, cartSramWait, isASWAN);
                   else
                      prefetchState <= PREFETCH_IDLE;
                   end if;
-               
-               when PREFETCH_WAIT   => prefetchState <= PREFETCH_RECEIVE;
+
+               when PREFETCH_WAIT =>
+                  if (prefetchExtraWait = '1') then
+                     if (ce = '1') then
+                        prefetchExtraWait <= '0';
+                        prefetchState     <= PREFETCH_RECEIVE;
+                     end if;
+                  else
+                     prefetchState <= PREFETCH_RECEIVE;
+                  end if;
                
                when PREFETCH_RECEIVE =>
                   prefetchState <= PREFETCH_IDLE;

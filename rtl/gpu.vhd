@@ -18,7 +18,10 @@ entity gpu is
       ce             : in  std_logic;
       reset          : in  std_logic;
       isColor        : in  std_logic;
-      
+
+      cartSramWait   : out std_logic; -- DISP_MODE(1): 0 = +0 cycles, 1 = +1 cycle
+      cartIoWait     : out std_logic; -- DISP_MODE(3): 0 = +0 cycles, 1 = +1 cycle
+
       IRQ_LineComp   : out std_logic;
       IRQ_VBlankTmr  : out std_logic;
       IRQ_VBlank     : out std_logic;
@@ -119,9 +122,11 @@ architecture arch of gpu is
    signal newLine             : std_logic;
    signal lineY               : std_logic_vector(7 downto 0) := (others => '0');
    signal lineYNext           : std_logic_vector(7 downto 0) := (others => '0');
+   signal vtotalEff           : unsigned(7 downto 0); -- max(143, LCD_VTOTAL): last line index of the frame
          
-   -- latched regs      
+   -- latched regs
    signal displayControl      : std_logic_vector(7 downto 0) := (others => '0');
+	signal lcdCtrl             : std_logic_vector(7 downto 0) := (others => '0');
 	signal backColor           : std_logic_vector(7 downto 0) := (others => '0');
 	signal screenMapBase       : std_logic_vector(7 downto 0) := (others => '0');
 	signal scrollX1	         : std_logic_vector(7 downto 0) := (others => '0');
@@ -221,9 +226,27 @@ architecture arch of gpu is
    signal SS_MIXED_BACk       : std_logic_vector(REG_SAVESTATE_MIXED.upper downto REG_SAVESTATE_MIXED.lower);
 
    type t_ss_wired_or is array(0 to 2) of std_logic_vector(63 downto 0);
-   signal ss_wired_or : t_ss_wired_or;   
+   signal ss_wired_or : t_ss_wired_or;
 
-begin 
+   -- WonderSwan Color LCD_CTRL(1) approximate contrast boost: min(15, nibble * 1.5) per channel
+   function contrastBoost(color : std_logic_vector(11 downto 0)) return std_logic_vector is
+      variable result  : std_logic_vector(11 downto 0);
+      variable nibble  : unsigned(3 downto 0);
+      variable boosted : unsigned(4 downto 0);
+   begin
+      for i in 0 to 2 loop
+         nibble  := unsigned(color(i*4+3 downto i*4));
+         boosted := ('0' & nibble) + ("00" & nibble(3 downto 1));
+         if (boosted > 15) then
+            result(i*4+3 downto i*4) := x"F";
+         else
+            result(i*4+3 downto i*4) := std_logic_vector(boosted(3 downto 0));
+         end if;
+      end loop;
+      return result;
+   end function;
+
+begin
 
    export_vtime <= LINE_CUR;
 
@@ -284,9 +307,12 @@ begin
       RegBus_Dout <= wired_or;
    end process;
    
+   -- vtotal+1 = scanlines per frame, but the visible/vblank-timed portion is never shorter than 144 lines (ares ppu/ppu.cpp PPU::main)
+   vtotalEff <= to_unsigned(143, 8) when unsigned(LCD_VTOTAL) < 143 else unsigned(LCD_VTOTAL);
+
    IRQ_VBlankTmr <= '1' when (xCount = 255 and unsigned(LINE_CUR) = 143 and TMR_CTRL(2) = '1' and unsigned(VTMR_CTR) = 1) else '0';
-   
-   IRQ_LineComp  <= '1' when (xCount = 255 and ((unsigned(LINE_CUR) + 1 = unsigned(LINE_CMP)) or (unsigned(LINE_CUR) = 158 and unsigned(LINE_CMP) = 0))) else '0'; 
+
+   IRQ_LineComp  <= '1' when (xCount = 255 and ((unsigned(LINE_CUR) + 1 = unsigned(LINE_CMP)) or (unsigned(LINE_CUR) = vtotalEff and unsigned(LINE_CMP) = 0))) else '0';
    
    IRQ_VBlank    <= '1' when (xCount = 255 and unsigned(LINE_CUR) = 143) else '0'; 
    
@@ -354,6 +380,7 @@ begin
             
                -- latch registers and increase line
                displayControl <= DISP_CTRL;
+               lcdCtrl        <= LCD_CTRL;
                backColor      <= BACK_COLOR;
                screenMapBase  <= MAP_BASE;
                scrollX1	      <= SCR1_X;
@@ -369,10 +396,11 @@ begin
                spr2WinX1      <= SPR_WIN_X1;
                spr2WinY1      <= SPR_WIN_Y1;
             
-               if (unsigned(LINE_CUR) = 157) then
+               if (unsigned(LINE_CUR) = vtotalEff - 1) then
                   lineYNext   <= (others => '0');
-                  -- swap one line early: the LINE_CUR=158 sprite prefetch below already targets
-                  -- next frame's line 0, so it must see the buffer this frame's DMA just filled
+                  -- swap one line early: the fetch-ahead prefetch at LINE_CUR=vtotalEff below
+                  -- already targets next frame's line 0, so it must see the buffer this frame's
+                  -- DMA just filled
                   spriteField <= 1 - spriteField;
                elsif (lineYNext = LCD_VTOTAL) then
                   lineYNext <= (others => '0');
@@ -380,10 +408,10 @@ begin
                   lineYNext <= std_logic_vector(unsigned(lineYNext) + 1);
                end if;
                lineY <= lineYNext;
-            
-               if (unsigned(LINE_CUR) < 158) then
+
+               if (unsigned(LINE_CUR) < vtotalEff) then
                   LINE_CUR <= std_logic_vector(unsigned(LINE_CUR) + 1);
-               else 
+               else
                   LINE_CUR <= (others => '0');
                end if;
 
@@ -438,6 +466,9 @@ begin
    depth2      <= '1' when DISP_MODE(7 downto 6) /= "11" else '0';
    isGray      <= not DISP_MODE(7);
    isPacked    <= '1' when DISP_MODE(7 downto 5) = "111" else '0';
+
+   cartSramWait <= DISP_MODE(1);
+   cartIoWait   <= DISP_MODE(3);
    
    -- orientation
    process (clk)
@@ -546,7 +577,7 @@ begin
          case (spriteLineState) is
          
             when IDLE =>
-               if (xCount = 32 and (unsigned(LINE_CUR) < 143 or unsigned(LINE_CUR) = 158)) then
+               if (xCount = 32 and (unsigned(LINE_CUR) < 143 or unsigned(LINE_CUR) = vtotalEff)) then
                   spriteLineCounter <= 0;
                   spritesOnLine     <= 0;
                   spritesClearNext  <= '1';
@@ -748,7 +779,15 @@ begin
             if (tileActive_BG1  = '1' and (tileColor_BG1  /= x"0" or (depth2 = '1' and tilePalette_BG1(2)  = '0'))) then output_bg1  := '1'; end if;
             if (tileActive_SPR  = '1' and (tileColor_SPR  /= x"0" or (depth2 = '1' and tilePalette_SPR(2)  = '0'))) then output_spr  := '1'; end if;
             if (tileActive_SPR2 = '1' and (tileColor_SPR2 /= x"0" or (depth2 = '1' and tilePalette_SPR2(2) = '0'))) then output_spr2 := '1'; end if;
-            
+
+            -- LCD_CTRL(0): when the display is off, only the backdrop color is shown (ares ppu/dac.cpp PPU::DAC::pixel)
+            if (lcdCtrl(0) = '0') then
+               output_bg0  := '0';
+               output_bg1  := '0';
+               output_spr  := '0';
+               output_spr2 := '0';
+            end if;
+
             if (isGray = '1') then
             
                if (output_spr = '1' and (tilePrio_SPR = '1' or output_bg1 = '0')) then
@@ -806,9 +845,13 @@ begin
                else
                   Color_addr <= backColor;
                end if;
-               
-               colorall <= Color_dataread(11 downto 0);
-               
+
+               if (isColor = '1' and lcdCtrl(1) = '1') then
+                  colorall <= contrastBoost(Color_dataread(11 downto 0));
+               else
+                  colorall <= Color_dataread(11 downto 0);
+               end if;
+
                pixel_out_data <= colorall;
             
             end if;

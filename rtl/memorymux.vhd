@@ -56,7 +56,10 @@ entity memorymux is
       EXTRAM_be            : out std_logic_vector(1 downto 0);
       EXTRAM_addr          : out std_logic_vector(24 downto 0);
       EXTRAM_datawrite     : out std_logic_vector(15 downto 0);
-      EXTRAM_dataread      : in  std_logic_vector(15 downto 0); 
+      EXTRAM_dataread      : in  std_logic_vector(15 downto 0);
+
+      cartRomWidth         : out std_logic; -- 0 = 8-bit cart bus, 1 = 16-bit
+      cartRomWait          : out std_logic; -- HW_FLAGS(3): 0 = +0 cycles, 1 = +1 cycle
       
       -- savestates              
       sleep_savestate      : in  std_logic;
@@ -86,6 +89,7 @@ architecture arch of memorymux is
    signal BANK_ROM1        : std_logic_vector(REG_BANK_ROM1.upper downto REG_BANK_ROM1.lower);
    
    signal HW_FLAGS_read    : std_logic_vector(REG_HW_FLAGS.upper downto REG_HW_FLAGS.lower);
+   signal HW_FLAGS_stored  : std_logic_vector(REG_HW_FLAGS.upper downto REG_HW_FLAGS.lower);
    signal HW_FLAGS_written : std_logic;
    signal HW_FLAGS_set     : std_logic;
    
@@ -139,7 +143,7 @@ begin
    iREG_BANK_ROM0   : entity work.eReg generic map ( REG_BANK_ROM0   ) port map (clk, RegBus_Din, RegBus_Adr, RegBus_wren, RegBus_rst, reg_wired_or( 2), BANK_ROM0    , BANK_ROM0); 
    iREG_BANK_ROM1   : entity work.eReg generic map ( REG_BANK_ROM1   ) port map (clk, RegBus_Din, RegBus_Adr, RegBus_wren, RegBus_rst, reg_wired_or( 3), BANK_ROM1    , BANK_ROM1); 
                                                                                                                                                      
-   iREG_HW_FLAGS    : entity work.eReg generic map ( REG_HW_FLAGS    ) port map (clk, RegBus_Din, RegBus_Adr, RegBus_wren, RegBus_rst, reg_wired_or( 4), HW_FLAGS_read, open, HW_FLAGS_written); 
+   iREG_HW_FLAGS    : entity work.eReg generic map ( REG_HW_FLAGS    ) port map (clk, RegBus_Din, RegBus_Adr, RegBus_wren, RegBus_rst, reg_wired_or( 4), HW_FLAGS_read, HW_FLAGS_stored, HW_FLAGS_written);
 
    process (reg_wired_or)
       variable wired_or : std_logic_vector(7 downto 0);
@@ -172,9 +176,12 @@ begin
                    x"07FFFF" when ramtype = x"05" else     
                    x"000000";
    
-   -- 
-   HW_FLAGS_read <= "100001" & isColor & HW_FLAGS_set;
-    
+   -- HW_FLAGS(7)=self-test passed, (6 downto 4)=unused (ares leaves 0), (3)=cartridgeRomWait, (2)=cartridgeRomWidth, (1)=!ASWAN, (0)=cartridgeEnable
+   HW_FLAGS_read <= "1000" & HW_FLAGS_stored(3) & HW_FLAGS_stored(2) & isColor & HW_FLAGS_set;
+
+   cartRomWidth <= HW_FLAGS_stored(2);
+   cartRomWait  <= HW_FLAGS_stored(3);
+
    process (clk)
    begin
       if rising_edge(clk) then

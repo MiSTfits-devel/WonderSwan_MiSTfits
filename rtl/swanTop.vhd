@@ -168,6 +168,12 @@ architecture arch of SwanTop is
    signal cpu_bus_datawrite      : std_logic_vector(15 downto 0);
    signal cpu_bus_dataread       : std_logic_vector(15 downto 0);
 
+   -- cartridge bus width / wait states (HW_FLAGS + DISP_MODE)
+   signal cartRomWidth           : std_logic;
+   signal cartRomWait            : std_logic;
+   signal cartSramWait           : std_logic;
+   signal cartIoWait             : std_logic;
+
    -- dma
    signal dma_active             : std_logic;
    signal sdma_active            : std_logic;
@@ -475,13 +481,16 @@ begin
       RegBus_rst           => RegBus_rst, 
       RegBus_Dout          => reg_wired_or(2),
       
-      EXTRAM_read          => EXTRAM_read,     
-      EXTRAM_write         => EXTRAM_write,    
-      EXTRAM_be            => EXTRAM_be,    
-      EXTRAM_addr          => EXTRAM_addr,     
+      EXTRAM_read          => EXTRAM_read,
+      EXTRAM_write         => EXTRAM_write,
+      EXTRAM_be            => EXTRAM_be,
+      EXTRAM_addr          => EXTRAM_addr,
       EXTRAM_datawrite     => EXTRAM_datawrite,
-      EXTRAM_dataread      => EXTRAM_dataread, 
-      
+      EXTRAM_dataread      => EXTRAM_dataread,
+
+      cartRomWidth         => cartRomWidth,
+      cartRomWait          => cartRomWait,
+
       sleep_savestate      => sleep_savestate,
 
       SSBUS_Din            => SSBUS_Din, 
@@ -502,14 +511,20 @@ begin
    icpu : entity work.cpu
    port map
    (
-      clk               => clk,  
-      ce                => ce_cpu,   
+      clk               => clk,
+      ce                => ce_cpu,
       ce_4x             => ce_4x,
       reset             => reset,
       turbo             => turbo,
       --SLOWTIMING        => is_simu,
       SLOWTIMING        => '0',
-   
+
+      isColor           => isColor,
+      cartRomWidth      => cartRomWidth,
+      cartRomWait       => cartRomWait,
+      cartSramWait      => cartSramWait,
+      cartIoWait        => cartIoWait,
+
       cpu_idle          => cpu_idle,
       cpu_halt          => cpu_halt,
       cpu_irqrequest    => cpu_irqrequest,
@@ -664,11 +679,14 @@ begin
    )
    port map
    (
-      clk            => clk,  
-      ce             => ce,   
+      clk            => clk,
+      ce             => ce,
       reset          => reset,
       isColor        => isColor,
-      
+
+      cartSramWait   => cartSramWait,
+      cartIoWait     => cartIoWait,
+
       IRQ_LineComp   => IRQ_LineComp ,
       IRQ_VBlankTmr  => IRQ_VBlankTmr,
       IRQ_VBlank     => IRQ_VBlank   ,
