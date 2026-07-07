@@ -87,15 +87,16 @@ begin
          
             if (useVoice = '1') then
                
+               -- bit3/1 = Full (priority), bit2/0 = Half - see APU::Channel2::output() in ares
                soundoutL <= (others => '0');
-               if    (SND_VOICE_CTRL(2) = '1') then soundoutL(7 downto 0) <= signed(SND_CH_Vol);
-               elsif (SND_VOICE_CTRL(3) = '1') then soundoutL(6 downto 0) <= signed(SND_CH_Vol(7 downto 1));
-               end if;    
+               if    (SND_VOICE_CTRL(3) = '1') then soundoutL(7 downto 0) <= signed(SND_CH_Vol);
+               elsif (SND_VOICE_CTRL(2) = '1') then soundoutL(6 downto 0) <= signed(SND_CH_Vol(7 downto 1));
+               end if;
 
                soundoutR <= (others => '0');
-               if    (SND_VOICE_CTRL(0) = '1') then soundoutR(7 downto 0) <= signed(SND_CH_Vol);
-               elsif (SND_VOICE_CTRL(1) = '1') then soundoutR(6 downto 0) <= signed(SND_CH_Vol(7 downto 1));
-               end if;                 
+               if    (SND_VOICE_CTRL(1) = '1') then soundoutR(7 downto 0) <= signed(SND_CH_Vol);
+               elsif (SND_VOICE_CTRL(0) = '1') then soundoutR(6 downto 0) <= signed(SND_CH_Vol(7 downto 1));
+               end if;
             
             else
 
