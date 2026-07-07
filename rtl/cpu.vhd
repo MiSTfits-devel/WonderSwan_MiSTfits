@@ -977,7 +977,12 @@ begin
                         when x"D4" => opcode <= OP_MULADJUST; cpustage <= CPUSTAGE_FETCHDATA1_8; source1 <= OPSOURCE_FETCHVALUE8; newDelay := 2; opsize <= 2;
                         when x"D5" => opcode <= OP_DIVADJUST; cpustage <= CPUSTAGE_FETCHDATA1_8; source1 <= OPSOURCE_FETCHVALUE8; newDelay := 4; opsize <= 2;
                      
-                     	when x"D6" | x"D7" => 
+                     	when x"D6" =>
+                           -- SALC: AL := carry ? 0xFF : 0x00, no memory access (formerly mis-decoded as XLAT)
+                           opcode <= OP_MOVREG; cpustage <= CPUSTAGE_EXECUTE; source1 <= OPSOURCE_IMMIDIATE; opsize <= 1; optarget <= OPTARGET_DECODE; target_decode <= CPU_REG_al; newDelay := 8;
+                           if (regs.FlagCar = '1') then immidiate8 <= x"FF"; else immidiate8 <= x"00"; end if;
+
+                     	when x"D7" =>
                            opcode <= OP_MOVREG; cpustage <= CPUSTAGE_CHECKDATAREADY; source1 <= OPSOURCE_MEM; opsize <= 1; optarget <= OPTARGET_DECODE; target_decode <= CPU_REG_al; newDelay := 3;
                            memSegment <= regs.reg_ds;
                            if (prefixSegmentES = '1') then memSegment <= regs.reg_es; end if;
@@ -985,7 +990,6 @@ begin
                            if (prefixSegmentSS = '1') then memSegment <= regs.reg_ss; end if;
                            if (prefixSegmentDS = '1') then memSegment <= regs.reg_ds; end if;
                            memAddr <= regs.reg_bx + regs.reg_ax(7 downto 0);
-                           if (opcodebyte = x"D6") then newDelay := 6; else newDelay := 3; end if;
                      
                         -- when x"D8" => fpo1
                         -- when x"D9" => fpo1
@@ -1081,7 +1085,7 @@ begin
                      MODRM_reg := unsigned(prefetchBuffer(5 downto 3));
                      MODRM_mod := unsigned(prefetchBuffer(7 downto 6));
                      
-                     if (opcodebyte = x"8E" and MODRM_reg = 3) then irqBlocked <= '1'; end if;
+                     if (opcodebyte = x"8E" and MODRM_reg = 2) then irqBlocked <= '1'; end if;
                      
                      newModDelay := delay;
                      
@@ -2047,13 +2051,15 @@ begin
                                     regs.FlagCar <= '1'; regs.FlagOvf <= '1';
                                  end if;
                               end if;
-                           
-                           when ALU_OP_MULI => 
+                              newZero := '1'; -- Z/S/P are undocumented on MULU; ares pins Z=1,S=0,P=0
+
+                           when ALU_OP_MULI =>
                               regs.FlagCar <= '0'; regs.FlagOvf <= '0';
                               if (opsize = 1) then
                                  result32 := unsigned(to_signed(to_integer(signed(source1Val(7 downto 0))) * to_integer(signed(memFetchValue2(7 downto 0))), 32));
                                  if (opcode = OP_NOP) then regs.reg_ax <= result32(15 downto 0); end if;
-                                 if (result32(31 downto 8) /= x"000000") then
+                                 -- overflow iff the signed result doesn't fit back in 8 bits (sign-extension check, not "any upper bit set")
+                                 if (signed(result32) /= resize(signed(result32(7 downto 0)), 32)) then
                                     regs.FlagCar <= '1'; regs.FlagOvf <= '1';
                                  end if;
                               else
@@ -2066,11 +2072,12 @@ begin
                                     regs.reg_ax <= result32(15 downto 0);
                                     regs.reg_dx <= result32(31 downto 16);
                                  end if;
-                                 if (result32(31 downto 16) /= x"0000") then
+                                 if (signed(result32) /= resize(signed(result32(15 downto 0)), 32)) then
                                     regs.FlagCar <= '1'; regs.FlagOvf <= '1';
                                  end if;
                               end if;
                               result := result32(15 downto 0);
+                              newZero := '1'; -- Z/S/P are undocumented on MULI; ares pins Z=1,S=0,P=0
                               
                            when ALU_OP_DECADJUST => 
                               result8 := regs.reg_ax(7 downto 0);
@@ -2692,14 +2699,23 @@ begin
                                  irqvector  <= (others => '0');
                               else
                                   if (opsize = 1) then
-                                    regs.reg_ax <= unsigned(DIVremainder(7 downto 0)) & unsigned(DIVquotient(7 downto 0));
+                                    -- quotient must fit in 8 bits unsigned, else INT 0 (divide error) and AX is left unchanged
+                                    if (DIVquotient > to_signed(255, 33)) then
+                                       irqrequest <= '1'; irqvector <= (others => '0');
+                                    else
+                                       regs.reg_ax <= unsigned(DIVremainder(7 downto 0)) & unsigned(DIVquotient(7 downto 0));
+                                    end if;
                                  else
-                                    regs.reg_ax <= unsigned(DIVquotient(15 downto 0));
-                                    regs.reg_dx <= unsigned(DIVremainder(15 downto 0));
+                                    if (DIVquotient > to_signed(65535, 33)) then
+                                       irqrequest <= '1'; irqvector <= (others => '0');
+                                    else
+                                       regs.reg_ax <= unsigned(DIVquotient(15 downto 0));
+                                       regs.reg_dx <= unsigned(DIVremainder(15 downto 0));
+                                    end if;
                                  end if;
                               end if;
-                           end if;  
-                           
+                           end if;
+
                          when OP_DIVI =>
                            if (opstep = 0 and ce = '1') then
                               delay      <= 10;
@@ -2719,14 +2735,23 @@ begin
                                  irqvector  <= (others => '0');
                               else
                                   if (opsize = 1) then
-                                    regs.reg_ax <= unsigned(DIVremainder(7 downto 0)) & unsigned(DIVquotient(7 downto 0));
+                                    -- quotient must fit in 8 bits signed (-128..127), else INT 0 and AX is left unchanged
+                                    if (DIVquotient > to_signed(127, 33) or DIVquotient < to_signed(-128, 33)) then
+                                       irqrequest <= '1'; irqvector <= (others => '0');
+                                    else
+                                       regs.reg_ax <= unsigned(DIVremainder(7 downto 0)) & unsigned(DIVquotient(7 downto 0));
+                                    end if;
                                  else
-                                    regs.reg_ax <= unsigned(DIVquotient(15 downto 0));
-                                    regs.reg_dx <= unsigned(DIVremainder(15 downto 0));
+                                    if (DIVquotient > to_signed(32767, 33) or DIVquotient < to_signed(-32768, 33)) then
+                                       irqrequest <= '1'; irqvector <= (others => '0');
+                                    else
+                                       regs.reg_ax <= unsigned(DIVquotient(15 downto 0));
+                                       regs.reg_dx <= unsigned(DIVremainder(15 downto 0));
+                                    end if;
                                  end if;
                               end if;
-                           end if;  
-                           
+                           end if;
+
                         when OP_MULADJUST =>
                            if (opstep = 0 and ce = '1') then
                               delay      <= 10;
