@@ -54,6 +54,7 @@ package pReg_swan is
    
    constant REG_DISP_MODE           : regmap_type := (16#60#,   7,      0,        1,        0,   readwrite);
    
+   constant REG_SND_HYPERVOICE      : regmap_type := (16#69#,   7,      0,        1,        0,   writeonly);
    constant REG_SND_HYPER_CTRL      : regmap_type := (16#6A#,   7,      0,        1,        0,   readwrite);
    constant REG_SND_HYPER_CHAN_CTRL : regmap_type := (16#6B#,   6,      0,        1,        0,   readwrite);
    
@@ -78,7 +79,6 @@ package pReg_swan is
    constant REG_SND_RANDOM_H        : regmap_type := (16#92#,   7,      0,        1,        0,   readwrite);
    constant REG_SND_RANDOM_L        : regmap_type := (16#93#,   6,      0,        1,        0,   readwrite);
    constant REG_SND_VOICE_CTRL      : regmap_type := (16#94#,   3,      0,        1,        0,   readwrite);
-   constant REG_SND_HYPERVOICE      : regmap_type := (16#95#,   7,      0,        1,        0,   readwrite);
    constant REG_SND_9697_H          : regmap_type := (16#96#,   7,      0,        1,        0,   readwrite);
    constant REG_SND_9697_L          : regmap_type := (16#97#,   1,      0,        1,        0,   readwrite);
    constant REG_SND_9899_H          : regmap_type := (16#98#,   7,      0,        1,        0,   readwrite);
